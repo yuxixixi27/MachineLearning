@@ -1,0 +1,1074 @@
+---
+Title: "Predicting Player Spending Behavior and Profitability in Mobile Games_Code"
+Author: "Yuxi Wang"
+format: html
+---
+
+# Import Data
+```{python}
+import pandas as pd
+import numpy as np
+import seaborn as sns
+import matplotlib.pyplot as plt
+from plotnine import *
+
+from sklearn.preprocessing import StandardScaler
+from sklearn.cluster import KMeans
+import statsmodels.api as sm
+
+from sklearn.model_selection import train_test_split
+from sklearn.linear_model import LinearRegression
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from sklearn.linear_model import LassoCV
+from sklearn.pipeline import Pipeline
+from sklearn.impute import SimpleImputer
+from sklearn.compose import ColumnTransformer
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.tree import DecisionTreeRegressor
+from sklearn.tree import plot_tree
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import roc_curve, roc_auc_score
+
+import xgboost as xgb # pip3 install xgboost==3.0.3
+import shap # pip3 install shap==0.49.1
+```
+
+
+```{python}
+df = pd.read_csv("/Users/xixi/Desktop/mobile_game_inapp_purchases.csv", encoding='latin-1')
+print(df.shape)
+print(df.columns)
+df.info()
+df.describe(include = 'all')
+missing_counts = df.isnull().sum()
+missing_counts
+df.dropna(subset=['Age', 'Gender', 'Country', 'Device', 'GameGenre'], inplace=True)
+df.tail()
+```
+So we see we have 3023 samples in the mobile_game_inapp_purchases dataset.
+
+```{python}
+df['InAppPurchaseAmount'] = pd.to_numeric(df['InAppPurchaseAmount'], errors='coerce').fillna(0)
+df['FirstPurchaseDaysAfterInstall'].fillna(0, inplace=True)
+df['PaymentMethod'].fillna('None', inplace=True)
+df.tail()
+```
+These are:
+UserID - Unique identifier for each user
+Age - User's age in years
+Gender - User's gender identity
+Country - User's country of origin
+Device - Mobile platform used
+GameGenre - Primary game genre played
+SessionCount - Number of gaming sessions
+AverageSessionLength - Average session duration in minutes
+SpendingSegment - Player spending classification
+InAppPurchaseAmount - Total purchase amount in USD FirstPurchaseDaysAfterInstall - Days until first purchase
+PaymentMethod - Preferred payment gateway
+LastPurchaseDate - Most recent purchase timestamp
+
+
+```{python}
+df['LastPurchaseDate'] = pd.to_datetime(df['LastPurchaseDate'], errors='coerce')
+df['DaysSinceLastPurchase'] = (df['LastPurchaseDate'].max() - df['LastPurchaseDate']).dt.days
+df['DaysSinceLastPurchase'].fillna(df['DaysSinceLastPurchase'].mean(), inplace=True)
+df.drop(columns=['LastPurchaseDate', 'UserID'], inplace=True, errors='ignore')
+df.tail()
+```
+
+
+```{python}
+df['EngagementScore'] = df['SessionCount'] * df['AverageSessionLength']
+df['AvgSpendPerSession'] = df['InAppPurchaseAmount'] / (df['SessionCount'] + 1)
+df["log_spend"] = np.log1p(df["InAppPurchaseAmount"])
+df.describe(include='all')
+```
+
+
+```{python}
+df = pd.get_dummies(
+    df,
+    columns=['Gender','Country','Device','GameGenre','PaymentMethod'],
+    drop_first=True
+)
+df.head()
+```
+
+
+```{python}
+cluster_features = df[['EngagementScore',
+                       'AverageSessionLength',
+                       'SessionCount',
+                       'log_spend']]
+cluster_features
+```
+
+
+```{python}
+scaler = StandardScaler()
+X_cluster = scaler.fit_transform(cluster_features)
+
+kmeans = KMeans(n_clusters=3, random_state=42)
+df['Cluster'] = kmeans.fit_predict(X_cluster)
+
+cluster_labels = {
+    0: 'Casual Player',
+    1: 'Regular Spender',
+    2: 'Whale User'
+}
+
+df['ClusterLabel'] = df['Cluster'].map(cluster_labels)
+```
+
+
+```{python}
+df.columns
+```
+
+
+```{python}
+cluster_stats = df.groupby("Cluster").agg(
+    avg_spend=("InAppPurchaseAmount", "mean"),
+    avg_log_spend=("log_spend", "mean"),
+    avg_engagement=("EngagementScore", "mean"),
+    count=("Cluster", "count")
+)
+cluster_stats.head()
+```
+
+
+```{python}
+cluster_stats_sorted = cluster_stats.sort_values("avg_spend")
+cluster_mapping = {}
+
+cluster_mapping[cluster_stats_sorted.index[0]] = "Casual Player"
+cluster_mapping[cluster_stats_sorted.index[1]] = "Regular Spender"
+cluster_mapping[cluster_stats_sorted.index[2]] = "Whale User"
+
+df["ClusterLabel"] = df["Cluster"].map(cluster_mapping)
+```
+
+
+```{python}
+df.groupby("ClusterLabel").agg(
+    avg_spend=("InAppPurchaseAmount", "mean"),
+    avg_log_spend=("log_spend", "mean"),
+    avg_engagement=("EngagementScore", "mean"),
+    count=("ClusterLabel", "count")
+)
+```
+Clustering reveals three distinct player types. Regular Spenders exhibit the highest engagement, whereas Whale Users spend the most but do not necessarily play longer or more frequently. This pattern aligns with industry observations that whales often purchase high-value bundles despite shorter playtime.
+
+
+```{python}
+genre_cols = [col for col in df.columns if col.startswith("GameGenre_")]
+genre_info = []
+
+for col in genre_cols:
+    genre_name = col.replace("GameGenre_", "")
+    avg_spend = df[df[col] == 1]['InAppPurchaseAmount'].mean()
+    genre_info.append((genre_name, avg_spend))
+
+genre_df = pd.DataFrame(genre_info, columns=["GameGenre","AvgSpending"]).sort_values(
+    by="AvgSpending", ascending=False
+)
+genre_df
+```
+
+# Data Visualization
+```{python}
+plot_dat = df.copy()
+```
+## Raw spend distribution
+```{python}
+g_1 = (
+    ggplot(plot_dat, aes(x="InAppPurchaseAmount"))
+    + geom_histogram(bins=60, color="blue", alpha=0.6)
+    + theme_bw()
+    + theme(
+        panel_grid_major=element_blank(),
+        panel_grid_minor=element_blank(),
+        panel_border=element_blank(),
+        panel_background=element_blank()
+    )
+    + labs(
+        title="Distribution of In-App Purchase Amount",
+        x="In-App Purchase Amount",
+        y="Count"
+    )
+)
+g_1
+```
+### Interpretation
+This histogram shows that most players spend little or nothing in the game. Almost the entire distribution is crowded at the very left, where spending is close to zero. Meanwhile, only a small number of players make large purchases, making the distribution right-skewed. This kind of pattern is very typical in free-to-play games: the majority of users never spend, while a small group of “whales” contribute most of the revenue.
+## Log-transformed spend
+```{python}
+g_2 = (
+    ggplot(plot_dat, aes(x="log_spend"))
+    + geom_histogram(bins=60, color="blue", alpha=0.6)
+    + theme_bw()
+    + theme(
+        panel_grid_major=element_blank(),
+        panel_grid_minor=element_blank(),
+        panel_border=element_blank(),
+        panel_background=element_blank()
+    )
+    + labs(
+        title="Distribution of Log-Transformed Spending",
+        x="log(1 + In-App Purchase Amount)",
+        y="Count"
+    )
+)
+g_2
+```
+### Interpretation
+After the transformation, the extreme values are pulled closer to the center, and the long right tail becomes more compressed. This allows us to see the underlying variation in spending much more clearly. Instead of one huge spike at zero and everything else squeezed to the far right, the log scale spreads the data out so that differences between low, medium, and high spenders are easier to observe.
+
+This cleaner shape is also more suitable for regression models, which generally perform better when the dependent variable is not heavily skewed.
+## Engagement vs log spend
+```{python}
+g_3 = (
+    ggplot(plot_dat, aes(x="EngagementScore", y="log_spend"))
+    + geom_point(alpha=0.3, color="green")
+    + geom_smooth(method="lm", color="red")
+    + theme_bw()
+        + theme(
+        panel_grid_major=element_blank(),
+        panel_grid_minor=element_blank(),
+        panel_border=element_blank(),
+        panel_background=element_blank()
+    )
+    + labs(
+        title="EngagementScore vs Log-Transformed Spending",
+        x="EngagementScore (Sessions × Duration)",
+        y="log(1 + In-App Purchase Amount)"
+    )
+)
+
+g_3
+```
+### Interpretation
+This plot shows how player engagement relates to their spending after applying a log transformation. While the overall trend line is fairly flat, the scatter points reveal some pattern. The players with higher engagement scores play more often or stay longer in each session—tend to have a broader range of spending levels. In other words, greater engagement does not guarantee higher spending, but it does increase the likelihood of spending something rather than nothing. We also see a large group of players with zero or very low spending across all engagement levels, which is typical for free-to-play games. Overall, the relationship appears weak and highly variable, suggesting that engagement alone is not enough to predict spending and that other factors likely play an important role.
+## Binned Engagement
+```{python}
+plot_dat['bin'] = pd.qcut(plot_dat['EngagementScore'], 20, labels=False)
+df_binned = plot_dat.groupby('bin')['log_spend'].mean().reset_index()
+
+df_binned['bin'] = df_binned['bin'] + 1
+
+g_4 = (
+    ggplot(df_binned, aes(x='bin', y='log_spend'))
+    + geom_col(fill="green")
+    + theme_bw()
+    + theme(
+        panel_grid_major=element_blank(),
+        panel_grid_minor=element_blank(),
+        panel_border=element_blank(),
+        panel_background=element_blank()
+    )
+    + labs(
+        title="Average Log Spending by EngagementScore Bin",
+        x="EngagementScore Bin (1 = Lowest, 20 = Highest)",
+        y="log(1 + Spending)"
+    )
+)
+
+g_4
+```
+### Interpretation
+This plot groups players into 20 equally sized engagement bins and shows the average log-transformed spending within each group. Overall, the bars stay within a fairly narrow range, which means that players with higher engagement scores do not consistently spend more than those with lower engagement. While a few bins show slightly higher average spending, the pattern is not strongly increasing or decreasing. In other words, engagement alone does not appear to be a strong or reliable predictor of how much a player spends, suggesting that other factors, such as game genre, spending segment, or demographics, likely play a more important role in driving purchase behavior.
+## Cluster visualization
+```{python}
+g_5 = (
+    ggplot(df, aes(x='EngagementScore', y='log_spend', color='ClusterLabel'))
+    + geom_point(alpha=0.4)
+    + theme_bw()
+    + theme(
+        panel_grid_major=element_blank(),
+        panel_grid_minor=element_blank(),
+        panel_border=element_blank(),
+        panel_background=element_blank()
+    )
+    + labs(
+        title="Player Segmentation Based on Engagement and Spending",
+        x="EngagementScore",
+        y="log(1 + Spending)",
+        color="Player Group"
+    )
+)
+
+g_5
+```
+### Interpretation
+This plot shows how players are grouped based on both engagement and spending. The three clusters overlap substantially, which suggests that engagement alone does not determine how much a player spends. However, some general patterns still appear. The “Whale User” group (blue) is more concentrated in the upper part of the plot, indicating consistently higher spending even though their engagement levels vary. The “Regular Spender” group (green) includes many players with higher engagement scores, showing that this segment tends to play more frequently or for longer sessions, but their spending remains in the mid-range. The “Casual Player” group (red) is spread across different engagement levels but remains mostly in the lower spending range. Overall, the clusters highlight broad behavioral tendencies, but with notable overlap that reflects the heterogeneous nature of player monetization in mobile games.
+## Spending by genre
+```{python}
+genre_plot = genre_df.copy()
+
+g_6 = (
+    ggplot(genre_plot, aes(x="GameGenre", y="AvgSpending"))
+    + geom_col(fill="grey", alpha=0.8)
+    + theme_bw()
+    + theme(
+        panel_grid_major=element_blank(),
+        panel_grid_minor=element_blank(),
+        panel_border=element_blank(),
+        panel_background=element_blank()
+    )
+    + theme(axis_text_x=element_text(rotation=45, hjust=1))
+    + labs(
+        title="Average Spending by Game Genre",
+        x="Game Genre",
+        y="Average In-App Purchase Amount"
+    )
+)
+
+g_6
+```
+### Interpretation
+This chart compares the average in-app purchase amount across different game genres. Although the differences are not extreme, some genres clearly attract higher spending than others. For example, Battle Royale, Racing, Strategy, Fighting, and MOBA games show noticeably higher average spending, which aligns with the fact that these genres often include competitive mechanics, progression systems, and more opportunities for microtransactions.
+## Session length vs spending
+```{python}
+g_7 = (
+    ggplot(plot_dat, aes(x="AverageSessionLength", y="log_spend"))
+    + geom_point(alpha=0.3)
+    + geom_smooth(method="lm", color="red")
+    + theme_bw()
+    + theme(
+        panel_grid_major=element_blank(),
+        panel_grid_minor=element_blank(),
+        panel_border=element_blank(),
+        panel_background=element_blank()
+    )
+    + labs(
+        title="Session Length vs Log-Transformed Spending",
+        x="Average Session Length (minutes)",
+        y="log(1 + Spending)"
+    )
+)
+
+g_7
+```
+### Interpretation
+This plot shows the relationship between a player’s average session length and their spending, using the log-transformed spending values for better visibility. After transformation, the data spreads out more evenly and the influence of a few extremely high-spending players is reduced. Even with the improved scale, there is no clear upward or downward trend. The regression line remains almost flat. This suggests that players who spend more do not necessarily play longer sessions, and players with similar session lengths can have very different spending levels.
+## Spending by country
+```{python}
+country_cols = [col for col in df.columns if col.startswith("Country_")]
+country_info = []
+
+for col in country_cols:
+    country_name = col.replace("Country_", "")
+    avg_spend = df[df[col] == 1]['InAppPurchaseAmount'].mean()
+    country_info.append((country_name, avg_spend))
+
+country_df = pd.DataFrame(country_info, columns=["Country", "AvgSpending"]).sort_values(
+    by="AvgSpending",
+    ascending=False
+)
+country_df
+
+g_8 = (
+    ggplot(country_df, aes(x="Country", y="AvgSpending"))
+    + geom_col(fill="pink")
+    + theme_bw()
+    + theme(axis_text_x=element_text(rotation=45, hjust=1))
+    + labs(
+        title="Average Spending by Country",
+        x="Country",
+        y="Avg Spending"
+    )
+)
+
+g_8
+```
+### Interpretation
+This plot compares the average in-app spending across different countries. The differences are quite noticeable: some countries show much higher spending levels than others. For example, Bangladesh, Canada, Denmark, India, and Russia stand out with relatively high average spending. At the same time, countries like Netherlands, France, Eygpt, and Australia fall toward the lower end of the range. These variations likely reflect differences in purchasing power, cultural attitudes toward mobile gaming, and how popular in-app purchases are in each region.
+
+```{python}
+df = pd.get_dummies(df, columns=['SpendingSegment'], drop_first=True)
+```
+
+```{python}
+X = df.drop(columns=['InAppPurchaseAmount','log_spend','Cluster','ClusterLabel'], errors='ignore')
+y = df['log_spend']
+
+X = X.select_dtypes(include=[np.number])
+
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+```
+
+# Linear Regression Model
+```{python}
+lr = LinearRegression()
+lr.fit(X_train, y_train)
+
+y_pred_lr = lr.predict(X_test)
+
+lr_mae = mean_absolute_error(y_test, y_pred_lr)
+lr_rmse = np.sqrt(mean_squared_error(y_test, y_pred_lr))
+lr_r2 = r2_score(y_test, y_pred_lr)
+
+print("Linear Regression MAE:", lr_mae)
+print("Linear Regression RMSE:", lr_rmse)
+print("Linear Regression R²:", lr_r2)
+```
+## Interpretation of Model
+The linear regression model trained on the log-transformed spending variable achieved an R² of 0.2806, meaning the model explains about 28% of the variability in player spending on the log scale.
+
+The MAE of 0.8905 and RMSE of 1.2638 indicate that prediction errors are moderately large on the log scale, suggesting that linear effects alone cannot capture the complexity of player spending behavior.
+
+Given the presence of strong nonlinear interactions among demographic, engagement, and behavioral variables, linear regression serves mainly as a baseline model
+
+# Lasso Regression Model
+```{python}
+X_train_lasso = X_train.copy()
+y_train_lasso = y_train.copy()
+
+scaler = StandardScaler()
+X_train_scaled = scaler.fit_transform(X_train_lasso)
+X_test_scaled  = scaler.transform(X_test)
+
+X_train_scaled_df = pd.DataFrame(X_train_scaled, columns=X_train.columns)
+
+alpha_grid = np.logspace(-4, 1, 50)
+
+lasso_cv = LassoCV(
+    alphas=alpha_grid,
+    cv=5,
+    random_state=42
+).fit(X_train_scaled_df, y_train_lasso)
+
+best_alpha = lasso_cv.alpha_
+print(f"Best alpha (λ): {best_alpha:.6f}")
+```
+
+```{python}
+y_pred_lasso = lasso_cv.predict(X_test_scaled)
+
+lasso_mae  = mean_absolute_error(y_test, y_pred_lasso)
+lasso_rmse = np.sqrt(mean_squared_error(y_test, y_pred_lasso))
+lasso_r2   = r2_score(y_test, y_pred_lasso)
+
+print("Lasso MAE:", lasso_mae)
+print("Lasso RMSE:", lasso_rmse)
+print("Lasso R²:", lasso_r2)
+```
+## Interpretation of Model
+We applied a Lasso regression model to identify the most important linear predictors of player spending and to perform feature selection through coefficient shrinkage. After cross-validation, the model selected an optimal penalty value of λ = 0.028118 and produced moderate predictive performance:
+
+MAE = 0.8903 RMSE = 1.2619 R² = 0.2828
+
+These metrics show that the Lasso model explains approximately 28% of the variance in log-transformed spending.
+```{python}
+coef_series = pd.Series(lasso_cv.coef_, index=X_train.columns)
+
+selected_features = (
+    coef_series[coef_series != 0]
+    .sort_values(ascending=False)
+)
+
+print("\nNon-zero coefficients (selected features):")
+print(selected_features)
+```
+## Interpretation of Feature Selection
+Using cross-validated Lasso regression, most features were shrunk to zero, indicating that they do not meaningfully contribute to predicting player spending. Only two variables retained non-zero coefficients, suggesting that these features capture the primary behavioral and structural patterns behind in-app purchase behavior.
+
+Positive Coefficients: The variables AvgSpendPerSession and FirstPurchaseDaysAfterInstall have positive coefficients, meaning that higher values of these features are associated with higher player spending.
+
+AvgSpendPerSession carries the largest positive coefficient. In practical terms, this means that players who tend to spend more money each time they play also end up being the highest spenders overall. The magnitude of this coefficient indicates that per-session spending intensity is the most critical linear predictor of total purchase behavior.
+
+FirstPurchaseDaysAfterInstall also retained a small positive coefficient, implying that players who make their first purchase earlier after installation generally exhibit higher long-term spending. The earlier a player starts paying, the more likely they are to become a high-value customer later.
+
+Together, these results show that Lasso identifies only two meaningful linear predictors: spending intensity per session and early purchase behavior. The absence of non-zero coefficients for demographic, geographic, and genre-related variables suggests that player spending patterns are driven primarily by behavioral factors.
+
+# Decision Tree Model
+```{python}
+X_train_dt = X_train.copy()
+y_train_dt = y_train.copy()
+
+X_test_dt = X_test.copy()
+```
+
+```{python}
+num_cols = X_train_dt.columns.tolist()
+
+preprocess_dt = ColumnTransformer(
+    transformers=[
+        ("num", Pipeline([
+            ("imputer", SimpleImputer(strategy="median")),
+            ("scaler", StandardScaler())
+        ]), num_cols)
+    ],
+    remainder="drop"
+)
+
+X_train_dt_trans = preprocess_dt.fit_transform(X_train_dt)
+X_test_dt_trans = preprocess_dt.transform(X_test_dt)
+```
+
+```{python}
+tree_reg = DecisionTreeRegressor(
+    max_depth=4,
+    random_state=42
+)
+
+tree_reg.fit(X_train_dt_trans, y_train_dt)
+```
+
+```{python}
+y_pred_dt = tree_reg.predict(X_test_dt_trans)
+
+dt_mae = mean_absolute_error(y_test, y_pred_dt)
+dt_rmse = np.sqrt(mean_squared_error(y_test, y_pred_dt))
+dt_r2 = r2_score(y_test, y_pred_dt)
+
+print("Decision Tree MAE:", dt_mae)
+print("Decision Tree RMSE:", dt_rmse)
+print("Decision Tree R²:", dt_r2)
+```
+## Interpretation of Model
+The decision tree model achieves strong predictive accuracy:
+
+MAE: 0.204 RMSE: 0.259 R²: 0.9699
+
+This indicates that the tree is able to capture meaningful nonlinear patterns in player spending behavior. However, the very high R² also suggests partial overfitting—an expected outcome given that decision trees can easily memorize fine-grained patterns in the training data when depth constraints are limited.
+
+Overall, the results show that the decision tree identifies useful structural relationships between behavioral variables and spending, but its performance should be interpreted cautiously. As a single tree, it lacks the regularization and averaging benefits of ensemble methods, making it more susceptible to fitting noise rather than generalizable patterns.
+```{python}
+plt.figure(figsize=(22, 12))
+plot_tree(
+    tree_reg,
+    feature_names=num_cols,
+    filled=True,
+    fontsize=8,
+    rounded=True
+)
+plt.title("Decision Tree Structure (max_depth=4)")
+plt.show()
+```
+## Interpretation of Decision Tree Structure
+The decision tree shows that AvgSpendPerSession is the only feature used to split the data. Every branch in the tree is based on a threshold of this variable, meaning the model relies entirely on how much a player typically spends per session to predict overall spending. This is fully consistent with the Random Forest results, which also identified AvgSpendPerSession as the dominant predictor.
+
+The tree also highlights clear nonlinear and threshold-based spending patterns. Small changes in AvgSpendPerSession correspond to large differences in predicted log-spending. Players with very low AvgSpendPerSession fall into the lowest spending group, while moderate increases in this value lead to much higher predicted spending. At the high end, players with large per-session purchases are placed in the highest spending category, representing heavy-spending “whale” users.
+
+No other behavioral or demographic variables, including session frequency, engagement score, recency, age, country, or payment method, appear in the tree. This indicates that once per-session spending intensity is known, additional variables offer little incremental predictive value. The dominance of this single feature reinforces the conclusion that spending intensity, rather than gameplay engagement or demographics, is the primary behavioral driver of in-app purchase outcomes.
+
+Overall, the decision tree clearly shows that player spending is shaped by a set of nonlinear thresholds based on AvgSpendPerSession. This also helps explain why the Random Forest performs so well: the data are largely structured around simple, threshold-based splits on per-session spending, which tree-based models are especially good at capturing.
+
+# Random Forest Model
+```{python}
+X_train_rf = X_train.copy()
+y_train_rf = y_train.copy()
+
+X_test_rf = X_test.copy()
+```
+
+```{python}
+num_cols = X_train_rf.columns.tolist()
+
+preprocess_rf = ColumnTransformer(
+    transformers=[
+        ("num", Pipeline([
+            ("imputer", SimpleImputer(strategy="median")),
+            ("scaler", StandardScaler())
+        ]), num_cols)
+    ],
+    remainder="drop"
+)
+
+X_train_rf_trans = preprocess_rf.fit_transform(X_train_rf)
+X_test_rf_trans = preprocess_rf.transform(X_test_rf)
+```
+
+```{python}
+rf_reg = RandomForestRegressor(
+    n_estimators=300,
+    max_depth=None,
+    random_state=42,
+    n_jobs=-1
+)
+
+rf_reg.fit(X_train_rf_trans, y_train_rf)
+```
+
+```{python}
+y_pred_rf = rf_reg.predict(X_test_rf_trans)
+
+rf_mae = mean_absolute_error(y_test, y_pred_rf)
+rf_rmse = np.sqrt(mean_squared_error(y_test, y_pred_rf))
+rf_r2 = r2_score(y_test, y_pred_rf)
+
+print("Random Forest MAE:", rf_mae)
+print("Random Forest RMSE:", rf_rmse)
+print("Random Forest R²:", rf_r2)
+```
+## Interpretation of Model
+We trained a Random Forest Regressor to capture potential nonlinear relationships between player behavior and in-app spending. After tuning and evaluating the model, the Random Forest achieved exceptionally strong predictive performance:
+
+MAE: 0.0251 RMSE: 0.0504 R²: 0.999
+
+These results show that the model explains more than 99.9% of the variance in log-transformed spending. Such exceptionally strong performance indicates that the Random Forest is able to capture highly complex nonlinear patterns in player behavior, particularly those related to session-level spending intensity.
+
+At the same time, the near-perfect R² suggests that the model may be overfitting. Because Random Forests allow trees to grow very deep, they can memorize detailed patterns in the training data rather than learning generalizable relationships. This makes it important to evaluate additional ensemble methods such as XGBoost, which apply stronger regularization and may provide a more realistic assessment of predictive performance.
+
+Overall, the Random Forest results highlight the presence of rich nonlinear behavioral structures in the data, but the extremely high accuracy should be interpreted cautiously given the potential for overfitting.
+
+```{python}
+rf_importance = pd.Series(
+    rf_reg.feature_importances_,
+    index=num_cols).sort_values(ascending=False)
+
+plt.figure(figsize=(8,6))
+rf_importance.head(15).plot(kind='barh')
+plt.title("Top 15 Feature Importances (Random Forest)")
+plt.xlabel("Importance Score")
+plt.tight_layout()
+plt.show()
+```
+## Interpretation of Feature Importances 
+This plot shows the top 15 features ranked by their importance in the Random Forest model when predicting log-transformed spending.
+
+AvgSpendPerSession overwhelmingly dominates the Random Forest model, contributing nearly all of the predictive signal for log-transformed spending. This indicates that the strongest and most reliable behavioral marker of high total spending is how much a player spends per session. Players who make larger purchases per game are consistently the highest spenders overall, regardless of how frequently or how long they play.
+
+In contrast, all other behavioral and demographic variables, including session count, engagement score, session length, recency, age, and first-purchase timing, exhibit negligible importance. Once per-session spending is known, these additional features provide little incremental value to the model. This pattern reinforces the conclusion that heavy spenders are distinguished primarily by the intensity of their spending per session rather than by how often they engage with the game.
+
+# XGBoost Model
+```{python}
+X_train_xgb = X_train.copy()
+X_test_xgb  = X_test.copy()
+
+y_train_xgb = y_train.copy()
+y_test_xgb  = y_test.copy()
+```
+
+```{python}
+dtrain = xgb.DMatrix(data=X_train_xgb.values, label=y_train_xgb.values)
+dtest  = xgb.DMatrix(data=X_test_xgb.values,  label=y_test_xgb.values)
+```
+
+```{python}
+params = {
+    "objective": "reg:squarederror",
+    "eta": 0.10,
+    "max_depth": 6,
+    "subsample": 0.8,
+    "colsample_bytree": 0.8,
+    "eval_metric": ["rmse"],
+    "seed": 42,
+}
+
+num_boost_round = 300
+
+watchlist = [(dtrain, "train")]
+
+booster = xgb.train(
+    params=params,
+    dtrain=dtrain,
+    num_boost_round=num_boost_round,
+    evals=watchlist,
+    verbose_eval=50
+)
+```
+
+```{python}
+y_pred_xgb = booster.predict(dtest)
+
+xgb_mae  = mean_absolute_error(y_test_xgb, y_pred_xgb)
+xgb_rmse = np.sqrt(mean_squared_error(y_test_xgb, y_pred_xgb))
+xgb_r2   = r2_score(y_test_xgb, y_pred_xgb)
+
+print("XGBoost MAE:", xgb_mae)
+print("XGBoost RMSE:", xgb_rmse)
+print("XGBoost R²:", xgb_r2)
+```
+## Interpretation of Model
+The XGBoost model achieves extremely strong predictive performance:
+
+MAE: 0.0404 RMSE: 0.0638 R²: 0.9982
+
+This indicates that the model is able to capture nearly all of the variation in log-transformed spending. Compared with the single decision tree, XGBoost benefits from boosting's ability to correct residual errors across iterations, resulting in higher accuracy and better generalization.
+
+The results suggest that boosting captures the same threshold-based patterns identified in the decision tree but does so in a more stable and regularized way. As a result, the model fits complex relationships in the data without relying on deep individual trees. However, the near-perfect R² also suggests that the underlying data structure is highly predictable—driven primarily by per-session spending intensity—and that all tree-based ensemble methods (Random Forest and XGBoost) are able to model this pattern extremely effectively.
+
+```{python}
+cv_params = {
+    "objective": "reg:squarederror",
+    "eta": 0.10,
+    "max_depth": 6,
+    "subsample": 0.8,
+    "colsample_bytree": 0.8,
+    "eval_metric": "rmse",
+    "seed": 42,
+}
+
+cv_res = xgb.cv(
+    params=cv_params,
+    dtrain=dtrain,
+    num_boost_round=400,
+    nfold=5,
+    verbose_eval=20,
+    shuffle=True
+)
+```
+
+```{python}
+best_idx  = cv_res['test-rmse-mean'].idxmin()
+best_iter = best_idx + 1
+best_rmse = float(cv_res.loc[best_idx, 'test-rmse-mean'])
+
+print(f"Best iteration: {best_iter}")
+print(f"Minimum test RMSE: {best_rmse:.6f}")
+```
+## Interpretation of Cross-validation Results
+The cross-validation results show that the model reaches its lowest validation error at iteration 400, with a minimum test RMSE of 0.0896. This indicates that performance continues improving steadily across the boosting rounds, and the model benefits from a relatively large number of trees. The low RMSE suggests strong predictive accuracy on unseen data, while the choice of 400 boosting rounds reflects a balance between model complexity and validation performance. These results confirm that XGBoost effectively captures the underlying structure of the spending data without premature overfitting.
+
+```{python}
+df_plot = cv_res.reset_index().rename(columns={"index": "iter"})
+df_plot["iter"] = df_plot["iter"] + 1
+df_plot = df_plot.rename(columns=lambda c: c.replace("-", "_"))
+
+df_plot["rmse_lower"] = df_plot["test_rmse_mean"] - df_plot["test_rmse_std"]
+df_plot["rmse_upper"] = df_plot["test_rmse_mean"] + df_plot["test_rmse_std"]
+
+p_rmse = (
+    ggplot(df_plot, aes(x="iter", y="test_rmse_mean"))
+    + geom_line()
+    + geom_ribbon(aes(ymin="rmse_lower", ymax="rmse_upper"), alpha=0.15)
+    + geom_vline(xintercept=best_iter, linetype="dashed", alpha=0.6)
+    + theme_bw()
+    + labs(
+        title="XGBoost CV: Iterations vs Test RMSE",
+        x="Boosting iteration",
+        y="Test RMSE (mean ± 1 sd)"
+    )
+)
+p_rmse
+```
+## Interpretation of Cross-validation Curve
+The cross-validation curve shows that the test RMSE decreases rapidly during the first 50 boosting iterations, indicating that the model learns the most important structure in the data very early in training. After this point, the curve flattens and continues to decline gradually, reflecting smaller incremental improvements from later boosting rounds.
+
+The model reaches its minimum validation error at iteration 400, where the test RMSE stabilizes at approximately 0.0896.
+
+# Variable Importance
+```{python}
+feature_cols = X_train.columns.tolist()
+
+feat_map = {f"f{i}": feature_cols[i] for i in range(len(feature_cols))}
+
+print("Feature map sample:")
+list(feat_map.items())[:10]
+```
+
+```{python}
+imp_gain        = booster.get_score(importance_type='gain')
+imp_weight      = booster.get_score(importance_type='weight')
+imp_cover       = booster.get_score(importance_type='cover')
+imp_total_gain  = booster.get_score(importance_type='total_gain')
+imp_total_cover = booster.get_score(importance_type='total_cover')
+```
+
+```{python}
+def to_df(d, kind):
+    if not d:
+        return pd.DataFrame(columns=["feature_code","value","feature","kind"])
+
+    df = (
+        pd.Series(d)
+        .rename_axis("feature_code")
+        .reset_index(name="value")
+    )
+    df["feature"] = df["feature_code"].map(feat_map).fillna(df["feature_code"])
+    df["kind"] = kind
+    return df
+
+imp_long = pd.concat([
+    to_df(imp_gain, "gain"),
+    to_df(imp_weight, "weight"),
+    to_df(imp_cover, "cover"),
+    to_df(imp_total_gain, "total_gain"),
+    to_df(imp_total_cover, "total_cover"),
+], ignore_index=True)
+
+print("Importance (long format):")
+imp_long.head()
+```
+
+```{python}
+imp_wide = (
+    imp_long
+    .pivot_table(index=["feature_code","feature"],
+                 columns="kind",
+                 values="value",
+                 aggfunc="first")
+    .reset_index()
+)
+
+print("Importance (wide format):")
+imp_wide.head()
+```
+
+```{python}
+sc1 = StandardScaler()
+sc2 = StandardScaler()
+
+imp_wide["total_sum"] = (
+    sc1.fit_transform(imp_wide["total_gain"].fillna(0).values.reshape(-1,1))
+    +
+    sc2.fit_transform(imp_wide["total_cover"].fillna(0).values.reshape(-1,1))
+)
+
+print("Importance with total_sum:")
+imp_wide.sort_values("total_sum", ascending=False).head()
+```
+
+```{python}
+top15_feats = (
+    imp_wide.sort_values("total_sum", ascending=False)
+            .head(15)["feature"]
+            .tolist()
+)
+
+print("Top 15 features:")
+top15_feats
+```
+
+```{python}
+plot_long = pd.concat([
+    imp_long[imp_long["kind"].isin(["weight","total_gain","total_cover"])],
+    imp_wide[["feature_code","feature","total_sum"]]
+        .assign(kind="total_sum")
+        .rename(columns={"total_sum":"value"})
+], ignore_index=True)
+```
+
+```{python}
+plot_long = plot_long[plot_long["feature"].isin(top15_feats)].copy()
+```
+
+```{python}
+order = (
+    imp_wide.set_index("feature")
+            .loc[top15_feats, "total_sum"]
+            .sort_values(ascending=True)
+            .index.tolist()
+)
+
+plot_long["feature"] = pd.Categorical(plot_long["feature"],
+                                      categories=order,
+                                      ordered=True)
+```
+
+```{python}
+plot_long["metric"] = plot_long["kind"].map({
+    "weight": "Weight (split count)",
+    "total_gain": "Total Gain",
+    "total_cover": "Total Cover",
+    "total_sum": "Total Gain + Total Cover"
+}).fillna(plot_long["kind"])
+
+plot_long.head()
+```
+
+```{python}
+p_imp = (
+    ggplot(plot_long, aes(y="value", x="feature", fill="feature"))
+    + geom_col(alpha=0.85)
+    + coord_flip()
+    + facet_wrap("~metric", scales="free_x", ncol=2)
+    + theme_classic()
+    + theme(
+        legend_position="none",
+        axis_text_y=element_text(size=9),
+        axis_text_x=element_text(size=9)
+    )
+    + labs(
+        title="Top 15 XGBoost Features (Gain + Cover Importance)",
+        x="Importance value",
+        y="Feature"
+    )
+)
+
+p_imp
+```
+## Interpretation of XGBoost Features Plot
+Across all XGBoost importance measures, including gain, cover, weight, and their combined contribution, AvgSpendPerSession stands out by a wide margin as the dominant predictor of player spending. This indicates that the primary driver of in-app purchase behavior is not how often or how long players engage with the game, but how much they spend each time they log in.
+
+Other behavioral variables such as engagement score, average session length, recency of purchase, or session count, add only limited predictive value once per-session spending is taken into account. Demographic variables like age contribute even less.
+
+The consistency of rankings across all four importance definitions further validates the stability of the model and confirms that per-session spending intensity is the central structural determinant of spending outcomes in this dataset.
+
+# SHAP Value
+```{python}
+explainer = shap.TreeExplainer(booster)
+shap_values = explainer(X_train)
+```
+```{python}
+shap.plots.bar(shap_values, max_display=10)
+```
+## Interpretation of SHAP Summary Bar Plot
+The SHAP summary bar plot shows how much each feature contributes, on average, to the XGBoost model's predictions of player spending. The results make it clear that AvgSpendPerSession is the dominant factor. Its contribution is substantially larger than that of any other feature, meaning that the model relies primarily on this variable to explain variations in spending behavior.
+
+This suggests that the central driver of player spending is how much users typically spend during each play session. Other behavioral indicators, such as how many sessions they play, how long those sessions last, their engagement level, or how recently they made a purchase, provide only small additional contributions once the model already knows their per-session spending pattern. Demographic factors like age add very little.
+
+Overall, the SHAP bar plot reinforces the same pattern observed in earlier models. Player spending is shaped mainly by the intensity of spending within each session, while other behavioral and demographic variables play a secondary role with much smaller overall influence.
+
+```{python}
+shap.initjs()
+
+shap.plots.beeswarm(shap_values, max_display=25)
+```
+## Interpretation of SHAP Beeswarm Plot
+The SHAP beeswarm plot provides a detailed view of how each feature influences the XGBoost model’s predictions across individual players. The results again highlight AvgSpendPerSession as the most influential factor. Points with higher feature values, shown in red, tend to push the model toward higher spending predictions, while lower feature values, shown in blue, pull the prediction downward. This pattern shows that players who usually spend more in each session are consistently predicted to be high spenders.
+
+Other features, including session count, engagement score, session length, recency, and the timing of the first purchase, show much smaller spreads in their SHAP values. Their contributions remain concentrated near zero, meaning that they offer limited predictive variation across users. They still provide some nuanced adjustments, but their influence is far weaker compared with per-session spending. Age again plays a minimal role.
+
+Overall, the beeswarm plot demonstrates that spending intensity within each session is the key behavioral signal shaping the model’s predictions. The plot also confirms that other behavioral features add relatively small and localized adjustments rather than broad shifts in the model’s output.
+```{python}
+row_idx = 2000
+
+shap.plots.waterfall(shap_values[row_idx], max_display=25)
+```
+## Interpretation of SHAP Waterfall Plot
+For this player, the SHAP waterfall plot shows that the prediction is primarily driven by their very high AvgSpendPerSession value. This single feature contributes more than two full units to the model's output, pushing the prediction far above the baseline level. SessionCount also raises the predicted spending, although its effect is much smaller by comparison. Other behavioral variables—such as the timing of the first purchase, engagement score, recency, and age—add only marginal influence to the final prediction.
+
+Overall, the figure illustrates that this player is classified as a high spender mainly because they tend to spend a large amount of money each time they play. Other features provide small adjustments, but the dominant driver of the model’s decision is the user’s spending intensity per session.
+```{python}
+idx_list = [1, 2, 3, 4, 5]
+shap.decision_plot(
+    base_value = explainer.expected_value,
+    shap_values = shap_values.values[idx_list, :],
+    features = X_train.iloc[idx_list, :],
+    feature_names = X_train.columns.tolist()
+)
+```
+## Interpretation of 
+
+
+```{python}
+shap.plots.heatmap(shap_values[:200], max_display=25)
+```
+## Interpretation of SHAP Heatmap
+The SHAP heatmap provides a case-level view of how each feature contributes to the model’s predicted spending across individual players. A clear pattern emerges: AvgSpendPerSession consistently shows the strongest influence on model output, with large positive SHAP values for high-spending users and negative values for low-spending users. This indicates that how much a player spends per session is the dominant driver of predicted total spending.
+
+In contrast, the contributions from the remaining behavioral variables—such as session count, engagement, session length, and recency—are much smaller and fluctuate around zero. Their SHAP values appear mostly light-colored and centered, showing that their impact varies across individuals but rarely shifts predictions meaningfully. Demographic factors such as age contribute negligibly.
+
+Overall, the heatmap reinforces the earlier results: the model’s predictions are shaped almost entirely by spending intensity, while other behavioral and demographic features play only secondary roles. This consistency across the entire sample indicates that the model has learned a stable and interpretable structure rather than relying on noisy or idiosyncratic patterns.
+
+# Model Result Comparison
+```{python}
+results = pd.DataFrame({
+    "Model": ["Linear Regression", "Lasso Regression",
+              "Random Forest", "XGBoost", "Decision Tree"],
+    "MAE":   [lr_mae, lasso_mae, rf_mae, xgb_mae, dt_mae],
+    "RMSE":  [lr_rmse, lasso_rmse, rf_rmse, xgb_rmse, dt_rmse],
+    "R²":    [lr_r2, lasso_r2, rf_r2, xgb_r2, dt_r2]
+})
+
+print("\n=========== Model Performance Comparison ===========\n")
+print(results.sort_values("MAE"))
+```
+## Interpretation
+Across all models, the tree-based ensemble methods deliver the strongest predictive performance. Random Forest achieves the lowest MAE and RMSE and an R² close to 1, indicating that it captures nearly all of the variation in log-transformed spending. XGBoost performs similarly well, with only slightly higher error metrics, reflecting its ability to refine predictions through boosting while maintaining strong generalization.
+
+The single decision tree performs reasonably well but is noticeably less accurate than the ensemble models. Its higher errors and lower R² suggest that relying on one tree limits its ability to capture the full complexity of the spending patterns.
+
+In contrast, the linear models—both Linear Regression and Lasso—show substantially higher errors and much lower R² values. These models struggle because the relationship between behavioral variables and spending is highly nonlinear and dominated by threshold effects that linear methods cannot model effectively.
+
+Overall, the comparison shows that Random Forest and XGBoost are the most effective models for predicting player spending, with Random Forest slightly outperforming all others. Linear and Lasso regressions provide useful baselines but are not well suited to the nonlinear structure of the data.
+##
+```{python}
+g_avg_corr = (
+    ggplot(df, aes(x="AvgSpendPerSession", y="log_spend"))
+    + geom_point(alpha=0.3, color="green")
+    + geom_smooth(method="lm", color="red")
+    + theme_bw()
+    + theme(
+        panel_grid_major=element_blank(),
+        panel_grid_minor=element_blank(),
+        panel_border=element_blank(),
+        panel_background=element_blank()
+    )
+    + labs(
+        title="Avg Spend Per Session vs Log-Spend",
+        x="Average Spend Per Session",
+        y="log(1 + Spending)"
+    )
+)
+
+g_avg_corr
+```
+
+# Implications for Game Monetization Strategy: Whale vs. Non-whale
+```{python}
+threshold = df['InAppPurchaseAmount'].quantile(0.95)
+df['Whale'] = (df['InAppPurchaseAmount'] >= threshold).astype(int)
+
+df_cls = df.drop(columns=['Cluster', 'ClusterLabel'], errors='ignore')
+
+X_cls = df_cls.drop(columns=['Whale', 'InAppPurchaseAmount', 'log_spend'], errors='ignore')
+X_cls = X_cls.select_dtypes(include=[np.number])
+y_cls = df_cls['Whale']
+
+X_train_cls, X_test_cls, y_train_cls, y_test_cls = train_test_split(
+    X_cls, y_cls, test_size=0.2, random_state=42, stratify=y_cls
+)
+```
+
+```{python}
+log_reg = LogisticRegression(max_iter=500, class_weight='balanced')
+log_reg.fit(X_train_cls, y_train_cls)
+
+y_pred_cls = log_reg.predict(X_test_cls)
+y_prob_cls = log_reg.predict_proba(X_test_cls)[:, 1]
+```
+
+```{python}
+pred_dict = {
+    "Logistic Regression": y_prob_cls
+}
+
+curves = []
+aucs = {}
+
+for name, preds in pred_dict.items():
+    fpr, tpr, _ = roc_curve(y_test_cls, preds)
+    auc_val = roc_auc_score(y_test_cls, preds)
+    aucs[name] = auc_val
+    curves.append(pd.DataFrame({"fpr": fpr, "tpr": tpr, "Model": name}))
+
+df_curves = pd.concat(curves, ignore_index=True)
+df_curves["Label"] = df_curves["Model"].map(
+    lambda m: f"{m} (AUC={aucs[m]:.3f})"
+)
+```
+
+```{python}
+p_roc = (
+    ggplot(df_curves, aes(x="fpr", y="tpr", color="Label"))
+    + geom_line(size=1.05, alpha=0.95)
+    + geom_abline(intercept=0, slope=1, linetype="dashed", alpha=0.6)
+    + coord_equal()
+    + theme_classic()
+    + theme(
+        legend_position="bottom",
+        legend_title=element_text(size=9),
+        legend_text=element_text(size=9),
+        axis_text=element_text(size=9),
+        axis_title=element_text(size=10)
+    )
+    + labs(
+        title="ROC Curve: Whale vs Non-Whale",
+        x="False Positive Rate",
+        y="True Positive Rate",
+        color=""
+    )
+)
+
+p_roc
+```
+## Interpretation of ROC Curve
+The ROC curve shows that the logistic regression model achieves an AUC of 1.00, indicating perfect discrimination between whale users and non-whale users. The curve rises immediately to a true positive rate of 1.0 with almost no increase in false positives, demonstrating that the model can correctly identify whale users with virtually no classification errors.
+
+This near-perfect performance is expected given the structure of the dataset: whale users differ sharply from the rest of the population in terms of spending patterns, especially AvgSpendPerSession and other spending-related variables. As a result, the model is able to learn a very clear decision boundary separating the two groups.
+
+Overall, the ROC curve suggests that spending behavior contains highly distinctive signals that make whale users easy to detect using standard classification methods.
