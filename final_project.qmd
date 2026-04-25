@@ -1,0 +1,1108 @@
+---
+title: "Predicting Player Spending Behavior and Profitability in Mobile Games"
+author: "Yuxi Wang"
+format:
+  html:
+    toc: true
+    toc-location: left
+    toc-depth: 3
+    self-contained: true
+    theme: cosmo
+    code-fold: true
+    code-summary: "Show code"
+jupyter: python3
+---
+
+## 1. Introduction
+
+Mobile gaming is one of the fastest-growing and most profitable segments of the global entertainment market. Revenue in this space is highly concentrated: a small percentage of so-called "whale" users contribute a disproportionately large share of total spending. Understanding what drives players to spend — and whether that behavior can be predicted — has become a critical question for game studios seeking to optimize monetization strategies, improve retention, and forecast revenue.
+
+This project is motivated by two guiding research questions:
+
+- **Q1:** Which behavioral features are most strongly associated with players' in-app spending?
+- **Q2:** Do spending levels differ across game genres, countries, and payment methods?
+
+To answer these questions, I develop a suite of machine learning models — including Lasso regression, decision trees, random forests, XGBoost, and logistic regression — trained on a dataset of over 3,000 simulated mobile-game players. I also use SHAP values to interpret model behavior and identify the features that most influence spending outcomes.
+
+The results show that accurately predicting individual spending is challenging due to noisy behavioral signals, but consistent group-level patterns emerge — particularly around payment readiness, purchase recency, and early-lifecycle behavior — that can directly inform monetization strategy.
+
+---
+
+## 2. Setup: Imports and Data Loading 
+
+```{python}
+#| label: imports
+#| message: false
+#| warning: false
+
+import pandas as pd
+import numpy as np
+import seaborn as sns
+import matplotlib
+import matplotlib.pyplot as plt
+from plotnine import *
+
+from sklearn.preprocessing import StandardScaler
+from sklearn.cluster import KMeans
+from sklearn.model_selection import train_test_split
+from sklearn.linear_model import LinearRegression, LassoCV, LogisticRegression
+from sklearn.metrics import (mean_absolute_error, mean_squared_error, r2_score,
+                             confusion_matrix, classification_report,
+                             ConfusionMatrixDisplay, accuracy_score,
+                             roc_curve, roc_auc_score)
+from sklearn.pipeline import Pipeline
+from sklearn.impute import SimpleImputer
+from sklearn.compose import ColumnTransformer
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.tree import DecisionTreeRegressor, plot_tree
+
+import xgboost as xgb
+import shap
+from IPython.display import display
+
+matplotlib.rcParams['figure.dpi'] = 100
+```
+
+### 2.1 Load and Inspect the Dataset
+
+```{python}
+#| label: load-data
+
+df = pd.read_csv(
+    "~/Desktop/ND/Section 2/Machine Learning/Project/mobile_game_inapp_purchases.csv",
+    encoding='latin-1'
+)
+
+print(f"Raw dataset shape: {df.shape}")
+print(f"\nColumns:\n{df.columns.tolist()}")
+print(f"\nMissing values per column:\n{df.isnull().sum()[df.isnull().sum() > 0]}")
+```
+
+The raw dataset contains **3,024 player records** and 13 columns covering demographics, gameplay behavior, payment information, and spending amounts.
+
+### 2.2 Handle Missing Values
+
+```{python}
+#| label: clean-data
+
+# Drop rows with missing values in essential categorical fields
+df.dropna(subset=['Age', 'Gender', 'Country', 'Device', 'GameGenre'], inplace=True)
+
+# Fill remaining missings
+df['InAppPurchaseAmount'] = pd.to_numeric(df['InAppPurchaseAmount'], errors='coerce').fillna(0)
+df['FirstPurchaseDaysAfterInstall'].fillna(0, inplace=True)
+df['PaymentMethod'].fillna('None', inplace=True)
+
+print(f"Dataset after cleaning: {df.shape[0]} rows, {df.shape[1]} columns")
+```
+
+After removing observations with missing values in key behavioral or demographic fields, the final dataset contains **2,733 valid samples**, which serve as the basis for all modeling.
+
+**Variable Descriptions:**
+
+| Variable | Description |
+|---|---|
+| `UserID` | Unique player identifier (dropped before modeling) |
+| `Age` | Player age in years |
+| `Gender` | Player gender identity |
+| `Country` | Player's country of origin |
+| `Device` | Mobile platform (iOS / Android) |
+| `GameGenre` | Primary game genre played |
+| `SessionCount` | Number of gaming sessions |
+| `AverageSessionLength` | Average session duration in minutes |
+| `SpendingSegment` | Pre-labeled spending classification |
+| `InAppPurchaseAmount` | Total purchase amount in USD (regression target) |
+| `FirstPurchaseDaysAfterInstall` | Days from install to first purchase |
+| `PaymentMethod` | Preferred payment method |
+| `LastPurchaseDate` | Timestamp of most recent purchase |
+
+---
+
+## 3. Feature Engineering
+
+Feature engineering translates raw behavioral signals into model-ready predictors, informed by patterns identified in prior monetization research.
+
+### 3.1 Temporal Features
+
+```{python}
+#| label: feature-temporal
+
+# Convert purchase date and compute days since last purchase
+df['LastPurchaseDate'] = pd.to_datetime(df['LastPurchaseDate'], errors='coerce')
+df['DaysSinceLastPurchase'] = (df['LastPurchaseDate'].max() - df['LastPurchaseDate']).dt.days
+df['DaysSinceLastPurchase'].fillna(df['DaysSinceLastPurchase'].mean(), inplace=True)
+
+# Drop columns not used in modeling
+df.drop(columns=['LastPurchaseDate', 'UserID'], inplace=True, errors='ignore')
+```
+
+`DaysSinceLastPurchase` captures purchase recency: how long ago a player last made an in-app purchase. Prior research (Sifa et al., 2015) identifies recency as a strong predictor of future purchase behavior.
+
+### 3.2 Engagement and Spending Intensity Features
+
+```{python}
+#| label: feature-engineered
+
+# Engagement = total play activity (sessions × duration)
+df['EngagementScore'] = df['SessionCount'] * df['AverageSessionLength']
+
+# Per-session spending intensity (used for EDA only, excluded from modeling)
+df['AvgSpendPerSession'] = df['InAppPurchaseAmount'] / (df['SessionCount'] + 1)
+
+# Log-transform spending to reduce heavy right skew
+df['log_spend'] = np.log1p(df['InAppPurchaseAmount'])
+
+print("Engineered features added: EngagementScore, AvgSpendPerSession, log_spend")
+print(df[['EngagementScore', 'AvgSpendPerSession', 'log_spend']].describe().round(3))
+```
+
+- **`EngagementScore`** = `SessionCount × AverageSessionLength` — captures total gameplay activity.
+- **`AvgSpendPerSession`** = `InAppPurchaseAmount / SessionCount` — measures spending intensity per visit. This feature is excluded from model training since it is directly derived from the outcome variable.
+- **`log_spend`** = `log(1 + InAppPurchaseAmount)` — the primary regression target, which compresses the long right tail and improves model stability.
+
+### 3.3 One-Hot Encoding of Categorical Variables
+
+```{python}
+#| label: feature-encoding
+
+df = pd.get_dummies(
+    df,
+    columns=['Gender', 'Country', 'Device', 'GameGenre', 'PaymentMethod'],
+    drop_first=True,
+    dtype='float'
+)
+
+print(f"Dataset after one-hot encoding: {df.shape[0]} rows, {df.shape[1]} columns")
+```
+
+After encoding, the dataset expands to **62 columns**, covering all categorical indicators as binary dummy variables.
+
+### 3.4 Player Segmentation via K-Means Clustering
+
+To identify natural spending and engagement tiers among players, K-means clustering ($k = 3$) is applied on four behavioral features.
+
+```{python}
+#| label: clustering
+
+cluster_features = df[['EngagementScore', 'AverageSessionLength', 'SessionCount', 'log_spend']]
+
+scaler_cluster = StandardScaler()
+X_cluster = scaler_cluster.fit_transform(cluster_features)
+
+kmeans = KMeans(n_clusters=3, random_state=42, n_init=10)
+df['Cluster'] = kmeans.fit_predict(X_cluster)
+
+# Label clusters by average spending level (low → Casual, mid → Regular, high → Whale)
+cluster_stats = df.groupby("Cluster").agg(
+    avg_spend=("InAppPurchaseAmount", "mean"),
+    avg_engagement=("EngagementScore", "mean"),
+    count=("Cluster", "count")
+).sort_values("avg_spend")
+
+cluster_mapping = {
+    cluster_stats.index[0]: "Casual Player",
+    cluster_stats.index[1]: "Regular Spender",
+    cluster_stats.index[2]: "Whale User",
+}
+df["ClusterLabel"] = df["Cluster"].map(cluster_mapping)
+
+print("Cluster summary (sorted by average spending):")
+display(
+    df.groupby("ClusterLabel").agg(
+        avg_spend=("InAppPurchaseAmount", "mean"),
+        avg_log_spend=("log_spend", "mean"),
+        avg_engagement=("EngagementScore", "mean"),
+        count=("ClusterLabel", "count")
+    ).round(3)
+)
+```
+
+Three distinct player segments emerge: **Casual Players** (low spending, variable engagement), **Regular Spenders** (moderate spending, higher engagement), and **Whale Users** (high spending, regardless of engagement level). These segments are used for visualization and contextual interpretation rather than as model inputs.
+
+---
+
+## 4. Exploratory Data Analysis
+
+This section presents 11 exploratory visualizations covering the distribution of the target variable, behavioral predictors, and spending patterns across genres, countries, and payment methods.
+
+```{python}
+#| label: eda-setup
+#| include: false
+
+# Snapshot for plotting
+plot_dat = df.copy()
+```
+
+### 4.1 Spending Distribution
+
+```{python}
+#| label: fig-raw-spend
+#| fig-cap: "Distribution of raw in-app purchase amounts"
+
+g_1 = (
+    ggplot(plot_dat, aes(x="InAppPurchaseAmount"))
+    + geom_histogram(bins=60, color="blue", alpha=0.6)
+    + theme_bw()
+    + theme(panel_grid_major=element_blank(), panel_grid_minor=element_blank(),
+            panel_border=element_blank(), panel_background=element_blank())
+    + labs(title="Figure 1: Distribution of In-App Purchase Amount",
+           x="In-App Purchase Amount (USD)", y="Count")
+)
+display(g_1.draw()); plt.close('all')
+```
+
+```{python}
+#| label: fig-log-spend
+#| fig-cap: "Distribution of log-transformed spending"
+
+g_2 = (
+    ggplot(plot_dat, aes(x="log_spend"))
+    + geom_histogram(bins=60, color="blue", alpha=0.6)
+    + theme_bw()
+    + theme(panel_grid_major=element_blank(), panel_grid_minor=element_blank(),
+            panel_border=element_blank(), panel_background=element_blank())
+    + labs(title="Figure 2: Distribution of Log-Transformed Spending",
+           x="log(1 + In-App Purchase Amount)", y="Count")
+)
+display(g_2.draw()); plt.close('all')
+```
+
+**Interpretation:** Figures 1 and 2 illustrate the extreme right skew in player spending. In the raw distribution, almost all players spend little or nothing, with a large spike at zero, while a small group drives the majority of revenue. After applying a log transformation, the distribution becomes more symmetric and compact — a necessary step before fitting regression models, which assume a reasonably well-behaved target variable.
+
+### 4.2 Engagement and Spending Relationship
+
+```{python}
+#| label: fig-engagement-spend
+#| fig-cap: "EngagementScore vs log-spending (scatter with regression line)"
+
+g_3 = (
+    ggplot(plot_dat, aes(x="EngagementScore", y="log_spend"))
+    + geom_point(alpha=0.3, color="green")
+    + geom_smooth(method="lm", color="red")
+    + theme_bw()
+    + theme(panel_grid_major=element_blank(), panel_grid_minor=element_blank(),
+            panel_border=element_blank(), panel_background=element_blank())
+    + labs(title="Figure 3: EngagementScore vs Log-Transformed Spending",
+           x="EngagementScore (Sessions × Duration)", y="log(1 + In-App Purchase Amount)")
+)
+display(g_3.draw()); plt.close('all')
+```
+
+```{python}
+#| label: fig-engagement-bins
+#| fig-cap: "Average log spending across 20 EngagementScore bins"
+
+plot_dat['bin'] = pd.qcut(plot_dat['EngagementScore'], 20, labels=False)
+df_binned = plot_dat.groupby('bin')['log_spend'].mean().reset_index()
+df_binned['bin'] = df_binned['bin'] + 1
+
+g_4 = (
+    ggplot(df_binned, aes(x='bin', y='log_spend'))
+    + geom_col(fill="green")
+    + theme_bw()
+    + theme(panel_grid_major=element_blank(), panel_grid_minor=element_blank(),
+            panel_border=element_blank(), panel_background=element_blank())
+    + labs(title="Figure 4: Average Log Spending by EngagementScore Bin",
+           x="EngagementScore Bin (1 = Lowest, 20 = Highest)", y="log(1 + Spending)")
+)
+display(g_4.draw()); plt.close('all')
+```
+
+**Interpretation:** Figures 3 and 4 both point to the same conclusion: **engagement does not strongly predict spending**. Figure 3 shows a nearly flat scatter cloud — many highly engaged players spend little, while some low-engagement players spend a lot. Figure 4 confirms this at the aggregate level: average log-spending remains largely flat across 20 engagement bins, with no clear upward trend. This aligns with findings from Sifa et al. (2015) and Hamari & Lehdonvirta (2010), who note that enjoyment and playtime do not necessarily translate into monetization.
+
+### 4.3 Per-Session Spending Intensity
+
+```{python}
+#| label: fig-avg-spend-session
+#| fig-cap: "AvgSpendPerSession vs log-spending"
+
+g_10 = (
+    ggplot(plot_dat, aes(x="AvgSpendPerSession", y="log_spend"))
+    + geom_point(alpha=0.3, color="purple")
+    + geom_smooth(method="lm", color="red", se=False)
+    + theme_bw()
+    + theme(panel_grid_major=element_blank(), panel_grid_minor=element_blank(),
+            panel_border=element_blank(), panel_background=element_blank())
+    + labs(title="Figure 5: AvgSpendPerSession vs Log-Transformed Spending",
+           x="Average Spend per Session (USD)", y="log(1 + In-App Purchase Amount)")
+)
+display(g_10.draw()); plt.close('all')
+```
+
+**Interpretation:** Unlike total engagement, per-session spending intensity is strongly and positively associated with total spending. Players who spend more per session tend to become the highest overall spenders. However, because `AvgSpendPerSession` is computed directly from the outcome variable, it is excluded from model training to avoid data leakage. It is shown here only as an exploratory finding.
+
+### 4.4 Spending by Game Genre
+
+```{python}
+#| label: fig-genre-spend
+#| fig-cap: "Average spending by game genre"
+
+genre_cols = [col for col in df.columns if col.startswith("GameGenre_")]
+genre_info = []
+for col in genre_cols:
+    genre_name = col.replace("GameGenre_", "")
+    avg_spend = df[df[col] == 1]['InAppPurchaseAmount'].mean()
+    genre_info.append((genre_name, avg_spend))
+
+genre_df = pd.DataFrame(genre_info, columns=["GameGenre", "AvgSpending"]).sort_values(
+    by="AvgSpending", ascending=False
+)
+
+g_6 = (
+    ggplot(genre_df, aes(x="GameGenre", y="AvgSpending"))
+    + geom_col(fill="grey", alpha=0.8)
+    + theme_bw()
+    + theme(panel_grid_major=element_blank(), panel_grid_minor=element_blank(),
+            panel_border=element_blank(), panel_background=element_blank(),
+            axis_text_x=element_text(rotation=45, hjust=1))
+    + labs(title="Figure 6: Average Spending by Game Genre",
+           x="Game Genre", y="Average In-App Purchase Amount (USD)")
+)
+display(g_6.draw()); plt.close('all')
+```
+
+**Interpretation:** Spending varies noticeably across game genres. Genres such as Battle Royale, Racing, Strategy, Fighting, and MOBA show the highest average spending — consistent with these genres' competitive mechanics, progression systems, and monetization structures that encourage repeated purchases.
+
+### 4.5 Spending by Country and Payment Method
+
+```{python}
+#| label: fig-country-spend
+#| fig-cap: "Average spending by country"
+
+country_cols = [col for col in df.columns if col.startswith("Country_")]
+country_info = []
+for col in country_cols:
+    country_name = col.replace("Country_", "")
+    avg_spend = df[df[col] == 1]['InAppPurchaseAmount'].mean()
+    country_info.append((country_name, avg_spend))
+
+country_df = pd.DataFrame(country_info, columns=["Country", "AvgSpending"]).sort_values(
+    by="AvgSpending", ascending=False
+)
+
+g_8 = (
+    ggplot(country_df, aes(x="Country", y="AvgSpending"))
+    + geom_col(fill="pink")
+    + theme_bw()
+    + theme(axis_text_x=element_text(rotation=45, hjust=1))
+    + labs(title="Figure 7: Average Spending by Country",
+           x="Country", y="Average Spending (USD)")
+)
+display(g_8.draw()); plt.close('all')
+```
+
+```{python}
+#| label: fig-payment-spend
+#| fig-cap: "Average spending by payment method"
+
+payment_cols = [col for col in df.columns if col.startswith("PaymentMethod_")]
+payment_info = []
+for col in payment_cols:
+    method = col.replace("PaymentMethod_", "")
+    avg_spend = df.loc[df[col] == 1, "InAppPurchaseAmount"].mean()
+    payment_info.append((method, avg_spend))
+
+payment_df = pd.DataFrame(payment_info, columns=["PaymentMethod", "AvgSpending"]).sort_values(
+    by="AvgSpending", ascending=False
+)
+
+g_9 = (
+    ggplot(payment_df, aes(x="PaymentMethod", y="AvgSpending"))
+    + geom_col(fill="skyblue", alpha=0.8)
+    + theme_bw()
+    + theme(axis_text_x=element_text(rotation=45, hjust=1),
+            panel_grid_major=element_blank(), panel_grid_minor=element_blank(),
+            panel_border=element_blank(), panel_background=element_blank())
+    + labs(title="Figure 8: Average Spending by Payment Method",
+           x="Payment Method", y="Average Spending (USD)")
+)
+display(g_9.draw()); plt.close('all')
+```
+
+**Interpretation:** Figures 7 and 8 reveal meaningful variation in spending across geographic and payment-method groups. Countries such as Bangladesh, Canada, Denmark, and India show relatively higher average spending, likely reflecting differences in purchasing power, cultural attitudes toward mobile gaming, and market penetration. Among payment methods, Debit Card and PayPal users spend the most on average. These patterns suggest that demographic and payment context carry some signal for spending — though as the modeling results show, they are not strong individual predictors.
+
+### 4.6 Session Length, Recency, and Player Segmentation
+
+```{python}
+#| label: fig-session-length
+#| fig-cap: "Session length vs log-spending"
+
+g_7 = (
+    ggplot(plot_dat, aes(x="AverageSessionLength", y="log_spend"))
+    + geom_point(alpha=0.3)
+    + geom_smooth(method="lm", color="red")
+    + theme_bw()
+    + theme(panel_grid_major=element_blank(), panel_grid_minor=element_blank(),
+            panel_border=element_blank(), panel_background=element_blank())
+    + labs(title="Figure 9: Session Length vs Log-Transformed Spending",
+           x="Average Session Length (minutes)", y="log(1 + Spending)")
+)
+display(g_7.draw()); plt.close('all')
+```
+
+```{python}
+#| label: fig-recency
+#| fig-cap: "Days since last purchase vs log-spending"
+
+g_11 = (
+    ggplot(plot_dat, aes(x="DaysSinceLastPurchase", y="log_spend"))
+    + geom_point(alpha=0.3, color="navy")
+    + geom_smooth(method="lm", color="red")
+    + theme_bw()
+    + theme(panel_grid_major=element_blank(), panel_grid_minor=element_blank(),
+            panel_border=element_blank(), panel_background=element_blank())
+    + labs(title="Figure 10: DaysSinceLastPurchase vs Log-Transformed Spending",
+           x="Days Since Last Purchase", y="log(1 + In-App Purchase Amount)")
+)
+display(g_11.draw()); plt.close('all')
+```
+
+```{python}
+#| label: fig-clusters
+#| fig-cap: "K-means player segmentation by engagement and spending"
+
+g_5 = (
+    ggplot(df, aes(x='EngagementScore', y='log_spend', color='ClusterLabel'))
+    + geom_point(alpha=0.4)
+    + theme_bw()
+    + theme(panel_grid_major=element_blank(), panel_grid_minor=element_blank(),
+            panel_border=element_blank(), panel_background=element_blank())
+    + labs(title="Figure 11: Player Segmentation by Engagement and Spending",
+           x="EngagementScore", y="log(1 + Spending)", color="Player Group")
+)
+display(g_5.draw()); plt.close('all')
+```
+
+**Interpretation:** Figures 9 and 10 show that both session length and purchase recency have very weak linear relationships with spending. The regression lines are essentially flat, and the scatter clouds show no systematic pattern. This is somewhat surprising, since recency is widely cited in the CRM literature, but it is consistent with the overall theme: individual spending in this dataset is noisy and hard to predict from behavioral metrics alone.
+
+Figure 11 (the cluster plot) confirms the three-tier structure identified by K-means. Whale Users cluster in the high-spending region regardless of engagement, Regular Spenders occupy a middle zone, and Casual Players remain at low spending levels across the full engagement range. This segmentation reinforces the observation that spending behavior depends more on individual disposition than on observable behavioral intensity.
+
+---
+
+## 5. Modeling Setup
+
+### 5.1 Feature Matrix and Target Variable
+
+```{python}
+#| label: modeling-setup
+
+# Feature matrix: exclude outcome and leakage variables
+X = df.drop(
+    columns=['InAppPurchaseAmount', 'log_spend', 'Cluster', 'ClusterLabel',
+             'AvgSpendPerSession', 'Whale', 'SpendingSegment'],
+    errors='ignore'
+)
+X = X.select_dtypes(include=[np.number])
+
+# Regression target: log-transformed spending
+y = df['log_spend']
+
+# 80/20 train/test split
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=0.2, random_state=42
+)
+
+print(f"Feature matrix: {X.shape[0]} rows × {X.shape[1]} features")
+print(f"Training set: {X_train.shape[0]} samples | Test set: {X_test.shape[0]} samples")
+```
+
+The final feature matrix includes **56 numeric predictors** after one-hot encoding. `AvgSpendPerSession` and `SpendingSegment` are excluded to prevent data leakage. The target is `log_spend` — the log-transformed in-app purchase amount.
+
+All models are trained on 80% of the data (~2,186 samples) and evaluated on the held-out 20% (~547 samples).
+
+---
+
+## 6. Regression Models
+
+### 6.1 Linear Regression (Baseline)
+
+```{python}
+#| label: linear-regression
+
+lr = LinearRegression()
+lr.fit(X_train, y_train)
+y_pred_lr = lr.predict(X_test)
+
+lr_mae  = mean_absolute_error(y_test, y_pred_lr)
+lr_rmse = np.sqrt(mean_squared_error(y_test, y_pred_lr))
+lr_r2   = r2_score(y_test, y_pred_lr)
+
+print(f"Linear Regression  |  MAE: {lr_mae:.4f}  |  RMSE: {lr_rmse:.4f}  |  R²: {lr_r2:.4f}")
+```
+
+The baseline linear regression explains only about **5% of the variance** in log-spending (R² ≈ 0.053), confirming that spending behavior does not follow simple linear patterns relative to the available features.
+
+### 6.2 Lasso Regression (Regularized Linear)
+
+```{python}
+#| label: lasso-regression
+
+scaler_lasso = StandardScaler()
+X_train_scaled = scaler_lasso.fit_transform(X_train)
+X_test_scaled  = scaler_lasso.transform(X_test)
+
+alpha_grid = np.logspace(-4, 1, 50)
+lasso_cv = LassoCV(alphas=alpha_grid, cv=5, random_state=42)
+lasso_cv.fit(X_train_scaled, y_train)
+
+y_pred_lasso = lasso_cv.predict(X_test_scaled)
+
+lasso_mae  = mean_absolute_error(y_test, y_pred_lasso)
+lasso_rmse = np.sqrt(mean_squared_error(y_test, y_pred_lasso))
+lasso_r2   = r2_score(y_test, y_pred_lasso)
+
+print(f"Best α (λ): {lasso_cv.alpha_:.6f}")
+print(f"Lasso Regression   |  MAE: {lasso_mae:.4f}  |  RMSE: {lasso_rmse:.4f}  |  R²: {lasso_r2:.4f}")
+```
+
+```{python}
+#| label: lasso-coefficients
+
+coef_series = pd.Series(lasso_cv.coef_, index=X_train.columns)
+selected = coef_series[coef_series != 0].sort_values(ascending=False)
+print(f"\nNon-zero Lasso coefficients ({len(selected)} selected):")
+print(selected.round(4))
+```
+
+**Interpretation:** Lasso regression, tuned via 5-fold cross-validation, achieves the best R² among all models at approximately **0.10**. Lasso shrinks most coefficients to zero, retaining primarily country indicators and payment-method dummies while eliminating many behavioral features. This confirms that even the most informative linear signals are weak: the dominant predictors in the Lasso solution are categorical location and payment attributes rather than engagement metrics.
+
+### 6.3 Decision Tree Regressor
+
+```{python}
+#| label: decision-tree
+
+num_cols_dt = X_train.columns.tolist()
+
+preprocess_pipe = Pipeline([
+    ("imputer", SimpleImputer(strategy="median")),
+    ("scaler", StandardScaler())
+])
+
+X_train_dt_trans = preprocess_pipe.fit_transform(X_train)
+X_test_dt_trans  = preprocess_pipe.transform(X_test)
+
+tree_reg = DecisionTreeRegressor(max_depth=4, random_state=42)
+tree_reg.fit(X_train_dt_trans, y_train)
+
+y_pred_dt = tree_reg.predict(X_test_dt_trans)
+
+dt_mae  = mean_absolute_error(y_test, y_pred_dt)
+dt_rmse = np.sqrt(mean_squared_error(y_test, y_pred_dt))
+dt_r2   = r2_score(y_test, y_pred_dt)
+
+print(f"Decision Tree      |  MAE: {dt_mae:.4f}  |  RMSE: {dt_rmse:.4f}  |  R²: {dt_r2:.4f}")
+```
+
+```{python}
+#| label: fig-decision-tree
+#| fig-cap: "Decision tree structure (max_depth = 4)"
+#| fig-width: 22
+#| fig-height: 10
+
+plt.figure(figsize=(22, 10))
+plot_tree(
+    tree_reg,
+    feature_names=num_cols_dt,
+    filled=True,
+    fontsize=7,
+    rounded=True
+)
+plt.title("Figure 12: Decision Tree Structure (max_depth = 4)")
+plt.tight_layout()
+plt.show()
+```
+
+**Interpretation:** The decision tree (R² ≈ 0.075) explains slightly more variance than linear regression, capturing some nonlinear patterns. Inspection of the tree structure reveals a clear hierarchy of splits: the root splits on `PaymentMethod_None`, separating players without a stored payment method from those with one. Subsequent splits branch on country indicators (Bangladesh, India) and then on behavioral variables (EngagementScore, DaysSinceLastPurchase, SessionCount). This layered structure is interpretable and meaningful — payment readiness and geography matter most at the top-level segmentation.
+
+### 6.4 Random Forest Regressor
+
+```{python}
+#| label: random-forest
+
+X_train_rf_trans = preprocess_pipe.transform(X_train)
+X_test_rf_trans  = preprocess_pipe.transform(X_test)
+
+rf_reg = RandomForestRegressor(n_estimators=300, max_depth=None, random_state=42, n_jobs=-1)
+rf_reg.fit(X_train_rf_trans, y_train)
+
+y_pred_rf = rf_reg.predict(X_test_rf_trans)
+
+rf_mae  = mean_absolute_error(y_test, y_pred_rf)
+rf_rmse = np.sqrt(mean_squared_error(y_test, y_pred_rf))
+rf_r2   = r2_score(y_test, y_pred_rf)
+
+print(f"Random Forest      |  MAE: {rf_mae:.4f}  |  RMSE: {rf_rmse:.4f}  |  R²: {rf_r2:.4f}")
+```
+
+```{python}
+#| label: fig-rf-importance
+#| fig-cap: "Top 15 feature importances from the Random Forest model"
+
+rf_importance = pd.Series(
+    rf_reg.feature_importances_, index=num_cols_dt
+).sort_values(ascending=False)
+
+plt.figure(figsize=(8, 6))
+rf_importance.head(15).plot(kind='barh')
+plt.title("Figure 13: Top 15 Feature Importances (Random Forest)")
+plt.xlabel("Importance Score")
+plt.gca().invert_yaxis()
+plt.tight_layout()
+plt.show()
+```
+
+**Interpretation:** Despite using 300 trees, the Random Forest achieves only R² ≈ 0.045 — slightly below linear regression. This suggests that the behavioral features in this dataset lack sufficient incremental signal to benefit from ensemble flexibility. The feature importance plot (Figure 13) shows that `PaymentMethod_None`, `DaysSinceLastPurchase`, `EngagementScore`, `AverageSessionLength`, and `Age` receive the highest importance scores, consistent with the decision tree hierarchy. However, their absolute importance values remain low, indicating that no single feature is strongly predictive.
+
+### 6.5 XGBoost Regressor
+
+#### Training and Test Performance
+
+```{python}
+#| label: xgboost-train
+
+dtrain = xgb.DMatrix(data=X_train.values, label=y_train.values)
+dtest  = xgb.DMatrix(data=X_test.values,  label=y_test.values)
+
+params = {
+    "objective": "reg:squarederror",
+    "eta": 0.10,
+    "max_depth": 6,
+    "subsample": 0.8,
+    "colsample_bytree": 0.8,
+    "eval_metric": ["rmse"],
+    "seed": 42,
+}
+
+booster = xgb.train(
+    params=params,
+    dtrain=dtrain,
+    num_boost_round=300,
+    evals=[(dtrain, "train")],
+    verbose_eval=50
+)
+
+y_pred_xgb = booster.predict(dtest)
+
+xgb_mae  = mean_absolute_error(y_test, y_pred_xgb)
+xgb_rmse = np.sqrt(mean_squared_error(y_test, y_pred_xgb))
+xgb_r2   = r2_score(y_test, y_pred_xgb)
+
+print(f"XGBoost            |  MAE: {xgb_mae:.4f}  |  RMSE: {xgb_rmse:.4f}  |  R²: {xgb_r2:.4f}")
+```
+
+#### Cross-Validation: Selecting Optimal Iterations
+
+```{python}
+#| label: xgboost-cv
+
+cv_params = {**params, "eval_metric": "rmse"}
+
+cv_res = xgb.cv(
+    params=cv_params,
+    dtrain=dtrain,
+    num_boost_round=400,
+    nfold=5,
+    verbose_eval=20,
+    shuffle=True
+)
+
+best_idx  = cv_res['test-rmse-mean'].idxmin()
+best_iter = best_idx + 1
+best_rmse = float(cv_res.loc[best_idx, 'test-rmse-mean'])
+
+print(f"Best iteration: {best_iter}  |  Minimum CV test RMSE: {best_rmse:.6f}")
+```
+
+```{python}
+#| label: fig-xgb-cv
+#| fig-cap: "XGBoost cross-validation: RMSE vs boosting iterations"
+
+df_plot = cv_res.reset_index().rename(columns={"index": "iter"})
+df_plot["iter"] += 1
+df_plot = df_plot.rename(columns=lambda c: c.replace("-", "_"))
+df_plot["rmse_lower"] = df_plot["test_rmse_mean"] - df_plot["test_rmse_std"]
+df_plot["rmse_upper"] = df_plot["test_rmse_mean"] + df_plot["test_rmse_std"]
+
+p_rmse = (
+    ggplot(df_plot, aes(x="iter", y="test_rmse_mean"))
+    + geom_line()
+    + geom_ribbon(aes(ymin="rmse_lower", ymax="rmse_upper"), alpha=0.15)
+    + geom_vline(xintercept=best_iter, linetype="dashed", alpha=0.6)
+    + theme_bw()
+    + labs(title="Figure 14: XGBoost CV — Iterations vs Test RMSE",
+           x="Boosting Iteration", y="Test RMSE (mean ± 1 SD)")
+)
+display(p_rmse.draw()); plt.close('all')
+```
+
+**Interpretation:** Figure 14 shows the cross-validation learning curve. The test RMSE reaches its lowest around iteration 16, after which more boosting rounds begin to increase error — an early sign of overfitting. Even at the optimal point, the CV RMSE is similar to that of simpler models, indicating that XGBoost cannot extract additional signal from this feature set. The negative R² on the full test set (with 300 iterations) confirms that boosting without early stopping overshoots the true signal.
+
+#### XGBoost Feature Importance
+
+```{python}
+#| label: xgb-importance
+
+feature_cols = X_train.columns.tolist()
+feat_map = {f"f{i}": feature_cols[i] for i in range(len(feature_cols))}
+
+def importance_to_df(d, kind):
+    if not d:
+        return pd.DataFrame(columns=["feature_code", "value", "feature", "kind"])
+    out = pd.Series(d).rename_axis("feature_code").reset_index(name="value")
+    out["feature"] = out["feature_code"].map(feat_map).fillna(out["feature_code"])
+    out["kind"] = kind
+    return out
+
+imp_long = pd.concat([
+    importance_to_df(booster.get_score(importance_type='weight'),       "weight"),
+    importance_to_df(booster.get_score(importance_type='total_gain'),   "total_gain"),
+    importance_to_df(booster.get_score(importance_type='total_cover'),  "total_cover"),
+], ignore_index=True)
+
+imp_wide = (
+    imp_long.pivot_table(index=["feature_code", "feature"],
+                         columns="kind", values="value", aggfunc="first")
+    .reset_index()
+)
+
+sc1, sc2 = StandardScaler(), StandardScaler()
+imp_wide["total_sum"] = (
+    sc1.fit_transform(imp_wide["total_gain"].fillna(0).values.reshape(-1, 1)).flatten() +
+    sc2.fit_transform(imp_wide["total_cover"].fillna(0).values.reshape(-1, 1)).flatten()
+)
+
+top15_feats = imp_wide.sort_values("total_sum", ascending=False).head(15)["feature"].tolist()
+print("Top 15 XGBoost features (gain + cover):")
+print(top15_feats)
+```
+
+```{python}
+#| label: fig-xgb-importance
+#| fig-cap: "Top 15 XGBoost feature importances by weight, total gain, and total cover"
+
+plot_long = pd.concat([
+    imp_long[imp_long["kind"].isin(["weight", "total_gain", "total_cover"])],
+    imp_wide[["feature_code", "feature", "total_sum"]]
+        .assign(kind="total_sum").rename(columns={"total_sum": "value"})
+], ignore_index=True)
+
+plot_long = plot_long[plot_long["feature"].isin(top15_feats)].copy()
+
+order = (
+    imp_wide.set_index("feature").loc[top15_feats, "total_sum"]
+    .sort_values(ascending=True).index.tolist()
+)
+plot_long["feature"] = pd.Categorical(plot_long["feature"], categories=order, ordered=True)
+
+plot_long["metric"] = plot_long["kind"].map({
+    "weight":      "Weight (split count)",
+    "total_gain":  "Total Gain",
+    "total_cover": "Total Cover",
+    "total_sum":   "Total Gain + Total Cover"
+}).fillna(plot_long["kind"])
+
+p_imp = (
+    ggplot(plot_long, aes(y="value", x="feature", fill="feature"))
+    + geom_col(alpha=0.85)
+    + coord_flip()
+    + facet_wrap("~metric", scales="free_x", ncol=2)
+    + theme_classic()
+    + theme(legend_position="none",
+            axis_text_y=element_text(size=9),
+            axis_text_x=element_text(size=9))
+    + labs(title="Figure 15: Top 15 XGBoost Features (Gain + Cover Importance)",
+           x="Importance Value", y="Feature")
+)
+display(p_imp.draw()); plt.close('all')
+```
+
+**Interpretation:** Across all importance metrics, the same behavioral features consistently rank highest: `DaysSinceLastPurchase`, `AverageSessionLength`, `EngagementScore`, `Age`, `FirstPurchaseDaysAfterInstall`, `SessionCount`, and payment/country indicators. These rankings closely match those from the Random Forest, suggesting that a stable (if weak) signal exists around purchase recency, engagement intensity, and payment setup — regardless of the model used.
+
+---
+
+## 7. Model Interpretation: SHAP Analysis
+
+SHAP (SHapley Additive exPlanations) values decompose each model prediction into per-feature contributions, allowing us to understand not just *which* features matter, but *how* they influence predictions at both the global and individual levels.
+
+### 7.1 Global Feature Importance (SHAP Bar Plot)
+
+```{python}
+#| label: shap-setup
+#| message: false
+#| warning: false
+
+explainer   = shap.TreeExplainer(booster)
+shap_values = explainer(X_train)
+```
+
+```{python}
+#| label: fig-shap-bar
+#| fig-cap: "SHAP global feature importance (mean |SHAP value|)"
+
+shap.plots.bar(shap_values, max_display=10, show=True)
+```
+
+**Interpretation (Figure 16):** The SHAP bar plot confirms the feature importance rankings: `PaymentMethod_None`, `DaysSinceLastPurchase`, `EngagementScore`, `AverageSessionLength`, and `Age` are the top contributors to predicted log-spending on average. Most other categorical and demographic features are grouped into a negligible "sum of other features" bar, indicating that the model relies on a small, consistent subset of behavioral and payment signals.
+
+### 7.2 Feature Effect Distribution (SHAP Beeswarm)
+
+```{python}
+#| label: fig-shap-beeswarm
+#| fig-cap: "SHAP beeswarm plot: distribution of feature effects across all training players"
+
+shap.plots.beeswarm(shap_values, max_display=15, show=True)
+```
+
+**Interpretation (Figure 17):** The beeswarm plot shows how each feature moves predictions up or down across the full player population:
+
+- **`PaymentMethod_None`**: Having no payment method on file consistently lowers predicted spending (negative SHAP values). Players with a stored payment method are predicted to spend more.
+- **`DaysSinceLastPurchase`**: More recent purchasers receive higher predicted spending; long-inactive players are rated lower.
+- **`EngagementScore`, `AverageSessionLength`, `SessionCount`**: Higher values shift predictions slightly upward, but with a narrow range — indicating moderate and consistent influence.
+- Most other variables cluster around zero, confirming their negligible role.
+
+### 7.3 Individual Player Explanation (Waterfall Plot)
+
+```{python}
+#| label: fig-shap-waterfall
+#| fig-cap: "SHAP waterfall plot for a representative high-spending player (row 2000)"
+
+row_idx = 2000
+shap.plots.waterfall(shap_values[row_idx], max_display=15, show=True)
+```
+
+**Interpretation (Figure 18):** The waterfall plot traces the prediction for a single representative player, showing how each feature pushes the prediction above or below the baseline (the average log-spending). For high-spending players, short `DaysSinceLastPurchase`, high `EngagementScore`, long `AverageSessionLength`, and having a valid payment method all contribute positively. The pattern confirms that the model identifies high spenders primarily through recent activity, strong engagement, and payment readiness.
+
+### 7.4 Multi-Player Decision Paths (SHAP Decision Plot)
+
+```{python}
+#| label: fig-shap-decision
+#| fig-cap: "SHAP decision plot tracing predictions for 5 representative players"
+#| warning: false
+
+idx_list = [1, 2, 3, 4, 5]
+shap.decision_plot(
+    base_value   = explainer.expected_value,
+    shap_values  = shap_values.values[idx_list, :],
+    features     = X_train.iloc[idx_list, :],
+    feature_names= X_train.columns.tolist(),
+    show         = True
+)
+```
+
+**Interpretation (Figure 19):** The decision plot traces SHAP trajectories across several players simultaneously. Higher-spending players accumulate positive contributions through low recency, early first-purchase timing, stronger engagement, and having a specified payment method. Lower-spending players show the opposite pattern: long inactivity, `PaymentMethod_None`, and lower engagement pull predictions downward. The consistent alignment of these trajectories confirms that the model has learned a stable decision structure based on behavioral readiness and payment availability.
+
+### 7.5 Population-Level SHAP Heatmap
+
+```{python}
+#| label: fig-shap-heatmap
+#| fig-cap: "SHAP heatmap for 200 training players (top features shown)"
+
+shap.plots.heatmap(shap_values[:200], max_display=15, show=True)
+```
+
+**Interpretation (Figure 20):** The SHAP heatmap visualizes feature contributions for 200 players simultaneously. Distinct horizontal bands for `PaymentMethod_None`, `DaysSinceLastPurchase`, `EngagementScore`, and `AverageSessionLength` show clear and consistent red/blue contrasts across players. Most other features display faint patterns near zero. The systematic structure across many players shows that, despite the limited overall R², the XGBoost model has learned a stable and interpretable rule: **players who are recently active, highly engaged, and have a valid payment method are predicted to spend more**.
+
+---
+
+## 8. Model Comparison
+
+```{python}
+#| label: model-comparison
+
+results = pd.DataFrame({
+    "Model":  ["Linear Regression", "Lasso Regression", "Decision Tree",
+               "Random Forest",     "XGBoost"],
+    "MAE":    [lr_mae,    lasso_mae, dt_mae,    rf_mae,    xgb_mae],
+    "RMSE":   [lr_rmse,   lasso_rmse, dt_rmse,  rf_rmse,   xgb_rmse],
+    "R²":     [lr_r2,     lasso_r2,  dt_r2,     rf_r2,     xgb_r2]
+}).sort_values("R²", ascending=False).reset_index(drop=True)
+
+results["MAE"]  = results["MAE"].round(4)
+results["RMSE"] = results["RMSE"].round(4)
+results["R²"]   = results["R²"].round(4)
+
+print("Table 1: Regression Model Performance on Test Set\n")
+display(results)
+```
+
+**Interpretation (Table 1):** Across all five regression models, R² values remain between −0.10 and 0.10, and MAE stays near 1.0 log-spend unit. This consistently low explanatory power reflects the fundamental challenge of this task: **individual in-app spending is highly noisy and only weakly related to observable behavioral and demographic features**.
+
+- **Lasso** achieves the best R² (≈ 0.10) by regularizing most features to zero and retaining a small set of informative predictors.
+- **Decision Tree** (R² ≈ 0.07) captures some nonlinear structure through payment/country splits.
+- **Linear Regression** (R² ≈ 0.05) performs comparably despite fewer assumptions.
+- **Random Forest** (R² ≈ 0.045) surprisingly underperforms linear models, indicating that ensemble flexibility provides little benefit when the underlying signal is weak.
+- **XGBoost** (R² ≈ −0.10) without early stopping overfits on training noise, performing worse than predicting the mean.
+
+The overall conclusion is that predicting individual spending amounts with this feature set is not feasible with high accuracy. However, the consistent feature rankings across all models — payment readiness, recency, and engagement — provide actionable behavioral insights even when predictive accuracy is limited.
+
+---
+
+## 9. Classification: Identifying Whale Users
+
+Since spending is highly concentrated among a small group of "whale" users, early identification of these high-value players holds significant strategic importance for game studios. This section trains a logistic regression classifier to distinguish whales (top 5% of spenders) from all other players.
+
+### 9.1 Define Whale Label and Prepare Features
+
+```{python}
+#| label: whale-setup
+
+# Define whale = top 5% of spenders
+threshold = df['InAppPurchaseAmount'].quantile(0.95)
+df['Whale'] = (df['InAppPurchaseAmount'] >= threshold).astype(int)
+
+print(f"Whale threshold (95th percentile): ${threshold:.2f}")
+print(f"Whale users: {df['Whale'].sum()} ({df['Whale'].mean()*100:.1f}% of all players)")
+
+# Classification feature matrix
+df_cls = df.drop(columns=['Cluster', 'ClusterLabel'], errors='ignore')
+X_cls = df_cls.drop(
+    columns=['Whale', 'InAppPurchaseAmount', 'log_spend', 'AvgSpendPerSession', 'SpendingSegment'],
+    errors='ignore'
+)
+X_cls = X_cls.select_dtypes(include=[np.number])
+y_cls = df_cls['Whale']
+
+X_train_cls, X_test_cls, y_train_cls, y_test_cls = train_test_split(
+    X_cls, y_cls, test_size=0.2, random_state=42, stratify=y_cls
+)
+
+print(f"\nClassification training set: {X_train_cls.shape[0]} samples "
+      f"| Test set: {X_test_cls.shape[0]} samples")
+```
+
+### 9.2 Logistic Regression Classifier
+
+```{python}
+#| label: logistic-regression
+
+log_reg = LogisticRegression(max_iter=500, class_weight='balanced')
+log_reg.fit(X_train_cls, y_train_cls)
+
+y_pred_cls = log_reg.predict(X_test_cls)
+y_prob_cls = log_reg.predict_proba(X_test_cls)[:, 1]
+
+print(f"Accuracy: {accuracy_score(y_test_cls, y_pred_cls):.4f}")
+print(f"\nClassification Report:\n{classification_report(y_test_cls, y_pred_cls, target_names=['Non-Whale', 'Whale'])}")
+```
+
+```{python}
+#| label: fig-confusion-matrix
+#| fig-cap: "Confusion matrix — logistic regression whale classifier"
+
+cm = confusion_matrix(y_test_cls, (y_prob_cls >= 0.5).astype(int))
+disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=["Non-Whale", "Whale"])
+disp.plot(cmap="Blues")
+plt.title("Figure 21: Confusion Matrix — Logistic Regression (Whale Classification)")
+plt.tight_layout()
+plt.show()
+```
+
+### 9.3 ROC Curve and AUC
+
+```{python}
+#| label: fig-roc-curve
+#| fig-cap: "ROC curve for the whale vs non-whale classifier"
+
+fpr, tpr, _ = roc_curve(y_test_cls, y_prob_cls)
+auc_val = roc_auc_score(y_test_cls, y_prob_cls)
+
+df_roc = pd.DataFrame({"fpr": fpr, "tpr": tpr})
+df_roc["Label"] = f"Logistic Regression (AUC = {auc_val:.3f})"
+
+p_roc = (
+    ggplot(df_roc, aes(x="fpr", y="tpr", color="Label"))
+    + geom_line(size=1.05, alpha=0.95)
+    + geom_abline(intercept=0, slope=1, linetype="dashed", alpha=0.6)
+    + coord_equal()
+    + theme_classic()
+    + theme(legend_position="bottom",
+            legend_title=element_text(size=9),
+            legend_text=element_text(size=9))
+    + labs(title="Figure 22: ROC Curve — Whale vs Non-Whale",
+           x="False Positive Rate", y="True Positive Rate", color="")
+)
+display(p_roc.draw()); plt.close('all')
+```
+
+**Interpretation (Figures 21–22):** The logistic regression classifier achieves an AUC of approximately **0.583**, only marginally above the 0.5 diagonal representing random guessing. The ROC curve remains close to the diagonal across all thresholds, indicating very limited ability to distinguish whales from non-whales using the available feature set.
+
+This result is not unexpected. Several factors contribute to the poor discrimination:
+
+1. **Feature overlap**: Whale and non-whale players share similar behavioral profiles in this dataset.
+2. **Linear boundary**: Logistic regression cannot capture the complex, nonlinear boundaries that likely separate these groups.
+3. **Missing signals**: Early whale identification likely requires richer features such as purchase frequency sequences, shop visit history, and offer interactions — which are not present in this dataset.
+4. **Synthetic data**: The dataset may not fully capture the pronounced early behavioral differences between high-value users and the general population that are observable in real games.
+
+These findings highlight that **identifying high-value players early is significantly harder than predicting general spending trends**, and would require substantially richer behavioral data and more flexible classification methods.
+
+---
+
+## 10. Discussion and Business Implications
+
+### 10.1 Key Findings
+
+The regression results consistently show that **individual spending amounts are highly variable and only weakly explained by observable features** (R² = 0 to 0.10 across all models). Despite this limitation, the analysis yields several consistent and actionable findings:
+
+1. **Payment readiness is the strongest predictor.** `PaymentMethod_None` is the top feature across all tree-based models and SHAP analyses. Players without a stored payment method are systematically predicted to spend less.
+
+2. **Purchase recency matters more than engagement.** `DaysSinceLastPurchase` consistently ranks among the top features, while session count and session length provide only marginal predictive value. Being recently active is more informative than being highly engaged.
+
+3. **Early-lifecycle behavior is informative.** `FirstPurchaseDaysAfterInstall` appears consistently in feature rankings: players who begin purchasing early after installing tend to become higher spenders.
+
+4. **Demographics and game attributes contribute minimally.** Age, gender, device type, and most game-genre indicators have near-zero impact in SHAP analyses. Spending behavior appears driven far more by real-time behavioral signals than by static user attributes.
+
+5. **Whale identification is difficult with current features.** The logistic regression classifier achieves AUC ≈ 0.583, suggesting that early whale detection requires richer behavioral data beyond what is captured here.
+
+### 10.2 Implications for Monetization Strategy
+
+These findings translate into several concrete recommendations for mobile game studios:
+
+| Insight | Strategic Action |
+|---|---|
+| Payment readiness predicts spending | Incentivize early payment-method setup; reduce checkout friction |
+| Recent purchasers are more likely to buy again | Use recency-triggered notifications and time-limited offers |
+| Early purchase timing signals lifetime value | Prioritize onboarding-phase bundles and starter packs |
+| Engagement ≠ spending | Do not assume high-playtime players are high-value monetization targets |
+| Whale detection is currently limited | Invest in richer behavioral data collection for future classification |
+
+---
+
+## 11. Conclusion
+
+This project assessed whether mobile-game player spending can be predicted using behavioral, demographic, and payment features. Across all regression models — Linear, Lasso, Decision Tree, Random Forest, and XGBoost — R² values remained between 0 and 0.10, and individual-level predictions were noisy and inaccurate. These results confirm that in-app spending behavior is highly irregular and difficult to model precisely with the available feature set.
+
+Despite these limitations, the analysis uncovered consistent and interpretable behavioral patterns: **payment readiness, purchase recency, and early-lifecycle behavior** are the features most strongly associated with spending across all models and SHAP analyses. Engagement metrics, while intuitive, proved to be weak predictors — a counterintuitive finding that has important implications for how game studios target monetization interventions.
+
+The whale-classification model showed similarly limited predictive power (AUC ≈ 0.583), suggesting that early high-value user identification remains a difficult problem with this feature set.
+
+Taken together, the results show that while accurate individual prediction is currently out of reach, the consistent behavioral signals identified here — particularly around payment setup, recency, and early engagement — provide meaningful and actionable guidance for mobile-game monetization strategy.
+
+### Future Directions
+
+Meaningful extensions of this work would include:
+
+- Incorporating richer behavioral sequences (purchase history, in-game economic behavior, event participation)
+- Applying sequential models (LSTMs, Transformers) to capture temporal spending dynamics
+- Replacing logistic regression with XGBoost or focal-loss classifiers for whale detection
+- Exploring causal frameworks to understand whether interventions (e.g., earlier payment setup) *cause* higher lifetime value
+- Validating the framework on real (non-synthetic) behavioral data
+
+---
+
+## References
+
+Chen, P. P., Guitart, A., Fernández del Río, A., & Periáñez, Á. (2018). Customer lifetime value in video games using deep learning and parametric models. *arXiv preprint arXiv:1811.12799*.
+
+Costes, J.-M., & Bonnaire, C. (2022). Spending money in free-to-play games: Sociodemographic characteristics, motives, impulsivity and internet gaming disorder specificities. *International Journal of Environmental Research and Public Health, 19*(23), Article 15709.
+
+Hamari, J., & Lehdonvirta, V. (2010). Mobile gaming trends and revenue models. *Journal of Interactive Marketing, 24*(3), 139–150.
+
+Kim, H., & Lee, J. (2019). Measuring and forecasting mobile game app engagement. *Computers in Human Behavior, 92*, 221–233.
+
+Lee, C.-W., Chi, Y.-C., & Ilham, R. (2025). Digital dependence: Online game addiction to mobile app purchase intention. *Journal of Applied Finance & Banking, 15*(1), 1–20.
+
+Sifa, R., Hadiji, F., Drachen, A., Baldauf, M., Runge, J., Kersting, K., & Bauckhage, C. (2015). Predicting purchase decisions in mobile free-to-play games. *Proceedings of the 11th AIIDE Conference*.
+
+Zhang, S., Yan, X., Yang, X., Jia, B., & Wang, S. (2023). Out of the box thinking: Improving customer lifetime value modelling via expert routing and game whale detection. *arXiv preprint arXiv:2308.12729*.
+
+Zhang, Y., Liu, P., & Chen, H. (2021). Collaborative-enhanced prediction of spending on newly downloaded mobile games under consumption uncertainty. *Proceedings of the AAAI AIIDE Conference*.
